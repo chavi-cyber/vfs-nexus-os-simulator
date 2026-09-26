@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { supabase } from "./lib/supabase.js";
 import { 
   Folder, FolderOpen, File, FileCode, Terminal, HardDrive, Cpu, Disc, Plus,
   Lock, Unlock, Play, Pause, RotateCcw, Trash2, Edit3, Info, 
@@ -10,7 +11,6 @@ import {
 const TOTAL_BLOCKS = 64; // 64 blocks of 4KB - 256KB total virtual disk space
 const BLOCK_SIZE_KB = 4;
 const DISK_TRACK_SIZE = 200; // Tracks 0 to 199
-const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:5000/api";
 
 // CLEAN ICON COMPONENT WRAPPER (JSX)
 const Icon = ({ name, className = "w-4 h-4", onClick }) => {
@@ -139,7 +139,7 @@ function findFirstFile(nodes) {
   return null;
 }
 
-export default function App() {
+export default function App({ user, onStatusChange }) {
   const [activeTab, setActiveTab] = useState("overview"); // overview, vfs, concurrency, scheduler, pipeline, diskmap, logs
   const [fileSystem, setFileSystem] = useState(INITIAL_FILESYSTEM);
   const [selectedFile, setSelectedFile] = useState(INITIAL_FILESYSTEM[0].children[0]);
@@ -154,6 +154,7 @@ export default function App() {
 
   // Disk Scheduler State
   const [requestQueue, setRequestQueue] = useState([82, 170, 43, 140, 24, 16, 190]);
+  const [queueInput, setQueueInput] = useState("82, 170, 43, 140, 24, 16, 190");
   const [initialHead, setInitialHead] = useState(50);
   const [algorithm, setAlgorithm] = useState("SCAN");
   const [isSchedulingRunning, setIsSchedulingRunning] = useState(false);
@@ -161,8 +162,14 @@ export default function App() {
   const [totalSeekDistance, setTotalSeekDistance] = useState(0);
   const [seekSequence, setSeekSequence] = useState([]);
 
-  // Full Pipeline Simulation State
-  const [pipelineStep, setPipelineStep] = useState(0);
+useEffect(() => {
+  setQueueInput(requestQueue.join(", "));
+}, [requestQueue]);
+
+// Full Pipeline Simulation State
+const [pipelineStep, setPipelineStep] = useState(0);
+
+
   const [pipelineRunning, setPipelineRunning] = useState(false);
 
   // Modal State for New File/Folder
@@ -176,6 +183,11 @@ export default function App() {
   const [selectedBlockInfo, setSelectedBlockInfo] = useState(null);
   const [isHydrated, setIsHydrated] = useState(false);
   const saveTimerRef = useRef(null);
+  const saveChainRef = useRef(Promise.resolve());
+  const [loadError, setLoadError] = useState(false);
+  useEffect(() => {
+    onStatusChange?.(loadError ? "LOAD FAILED" : isHydrated ? "STATE LOADED" : "LOADING STATE");
+  }, [loadError, isHydrated, onStatusChange]);
 
   const addLog = (message, module = "SYSTEM", level = "INFO") => {
     const newLog = {
@@ -188,18 +200,47 @@ export default function App() {
     setLogs(prev => [newLog, ...prev.slice(0, 199)]);
   };
 
-// Load persistent state from SQLite through the Express API.
+// Load this authenticated user's private simulator state from Supabase.
   useEffect(() => {
     let cancelled = false;
+    setIsHydrated(false);
+    setLoadError(false);
+    // Clear the previous account's in-memory data before loading this account.
+    setFileSystem(INITIAL_FILESYSTEM);
+    setSelectedFile(INITIAL_FILESYSTEM[0].children[0]);
+    setLogs([]);
+    setThreads([]);
+    setActiveReadersCount(0);
+    setActiveWriter(null);
+    setIsMutexLocked(false);
+    setConcurrencyTargetFile("/documents/system_architecture.log");
+    setRequestQueue([82, 170, 43, 140, 24, 16, 190]);
+    setInitialHead(50);
+    setAlgorithm("SCAN");
+    setAnimatedHead(50);
+    setTotalSeekDistance(0);
+    setSeekSequence([]);
+    setPipelineStep(0);
+    setActiveTab("overview");
 
     const loadPersistentState = async () => {
       try {
-        const response = await fetch(`${API_BASE}/state`);
-        if (!response.ok) throw new Error(`API returned ${response.status}`);
-        const data = await response.json();
+        if (!user?.id) {
+  throw new Error("User is not logged in.");
+}
+
+const { data: savedRow, error } = await supabase
+  .from("user_simulator_states")
+  .select("state")
+  .eq("user_id", user.id)
+  .maybeSingle();
+
+if (error) throw error;
+
+const data = savedRow?.state ?? {};
         if (cancelled) return;
 
-        if (data.fileSystem?.length) {
+        if (Array.isArray(data.fileSystem)) {
           setFileSystem(data.fileSystem);
           setSelectedFile(findFirstFile(data.fileSystem));
         }
@@ -223,8 +264,9 @@ export default function App() {
   console.error("Persistent state load failed:", error);
 
   // Do not enable automatic saving if the initial load fails.
-  // This prevents default data from overwriting existing SQLite data.
+  // This prevents default data from overwriting existing Supabase data.
   setIsHydrated(false);
+  setLoadError(true);
 
   addLog(
     "Database connection failed. Changes will not be saved.",
@@ -233,7 +275,7 @@ export default function App() {
   );
 
   addLog(
-    "Check that the SQLite backend is running on port 5000, then refresh.",
+    "Could not load your Supabase state. Check your connection and sign in again.",
     "DATABASE",
     "WARN"
   );
@@ -242,10 +284,10 @@ export default function App() {
 
     loadPersistentState();
     return () => { cancelled = true; };
-  }, []);
+  }, [user?.id]);
 
   // Debounced persistence of the simulator's complete state.
-  // Automatically save simulator state to SQLite
+  // Automatically save this user's simulator state to Supabase
 useEffect(() => {
   if (!isHydrated) return;
 
@@ -253,41 +295,47 @@ useEffect(() => {
     clearTimeout(saveTimerRef.current);
   }
 
-  saveTimerRef.current = setTimeout(async () => {
+  saveTimerRef.current = setTimeout(() => {
+    // Serialize saves so an older request cannot finish after a newer one.
+    saveChainRef.current = saveChainRef.current.catch(() => {}).then(async () => {
     try {
-      const response = await fetch(`${API_BASE}/state`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          activeTab,
-          fileSystem,
-          logs: logs.slice(0, 200),
-          threads,
-          activeReadersCount,
-          activeWriter,
-          isMutexLocked,
-          concurrencyTargetFile,
-          requestQueue,
-          initialHead,
-          algorithm,
-          animatedHead,
-          totalSeekDistance,
-          seekSequence,
-          pipelineStep
-        })
-      });
+      if (!user?.id) return;
 
-      if (!response.ok) {
-        throw new Error(`Save failed: HTTP ${response.status}`);
-      }
+const { error } = await supabase
+  .from("user_simulator_states")
+  .upsert(
+    {
+      user_id: user.id,
+      state: {
+        activeTab,
+        fileSystem,
+        logs: logs.slice(0, 200),
+        threads,
+        activeReadersCount,
+        activeWriter,
+        isMutexLocked,
+        concurrencyTargetFile,
+        requestQueue,
+        initialHead,
+        algorithm,
+        animatedHead,
+        totalSeekDistance,
+        seekSequence,
+        pipelineStep
+      },
+      updated_at: new Date().toISOString()
+    },
+    { onConflict: "user_id" }
+  );
+
+if (error) throw error;
 
       console.log("VFS state saved successfully.");
 
     } catch (error) {
       console.error("Persistent state save failed:", error);
     }
+    });
   }, 350);
 
   return () => {
@@ -297,6 +345,7 @@ useEffect(() => {
   };
 }, [
   isHydrated,
+  user?.id,
   activeTab,
   fileSystem,
   logs,
@@ -662,7 +711,7 @@ useEffect(() => {
         head = r;
         sequence.push(head);
       });
-      if (right.length > 0) {
+      if (queue.length > 0) {
         totalDist += Math.abs((DISK_TRACK_SIZE - 1) - head);
         head = DISK_TRACK_SIZE - 1;
         sequence.push(head);
@@ -681,7 +730,7 @@ useEffect(() => {
         head = r;
         sequence.push(head);
       });
-      if (right.length > 0) {
+      if (queue.length > 0) {
         totalDist += Math.abs((DISK_TRACK_SIZE - 1) - head);
         head = DISK_TRACK_SIZE - 1;
         sequence.push(head);
@@ -700,8 +749,11 @@ useEffect(() => {
   };
 
   const runDiskScheduler = () => {
+    if (!isHydrated || isSchedulingRunning) return;
     setIsSchedulingRunning(true);
-    const { sequence, totalDist } = calculateDiskSchedule(requestQueue, initialHead, algorithm);
+    const head = Math.max(0, Math.min(199, Number.isFinite(initialHead) ? initialHead : 50));
+    setInitialHead(head);
+    const { sequence, totalDist } = calculateDiskSchedule(requestQueue, head, algorithm);
     setSeekSequence(sequence);
     setTotalSeekDistance(totalDist);
     addLog(`Running ${algorithm} Disk Scheduling over ${requestQueue.length} sector requests. Total distance: ${totalDist} tracks.`, "DISK", "SUCCESS");
@@ -719,7 +771,7 @@ useEffect(() => {
   };
 
   const runFullPipeline = async () => {
-    if (pipelineRunning) return;
+    if (pipelineRunning || !isHydrated) return;
 
     setPipelineRunning(true);
     setActiveTab("pipeline");
@@ -838,27 +890,9 @@ useEffect(() => {
   return (
     <div className="min-h-screen bg-[#0d1117] text-slate-200 font-sans flex flex-col antialiased selection:bg-cyan-500 selection:text-black">
       {/* TOP HEADER STATUS BAR */}
-      <header className="h-14 border-b border-slate-800 bg-[#161b22]/90 backdrop-blur px-4 flex items-center justify-between sticky top-0 z-50">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-lg shadow-cyan-500/20">
-            <Icon name="cpu" className="w-5 h-5 text-black" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-slate-100 tracking-wide text-sm">VFS NEXUS</span>
-              <span className="text-[10px] bg-cyan-950 text-cyan-400 border border-cyan-800/60 px-1.5 py-0.5 rounded font-mono">v3.8-HYBRID</span>
-               <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono border ${
-                 isHydrated ? "bg-emerald-950 text-emerald-400 border-emerald-800/60" : "bg-amber-950 text-amber-400 border-amber-800/60"
-               }`}>
-                 {isHydrated ? "STATE LOADED" : "LOADING STATE"}
-               </span>
-            </div>
-            <p className="text-[11px] text-slate-400 hidden sm:block">Virtual File System & Disk Intelligence Simulator</p>
-          </div>
-        </div>
-
+      <header className="min-h-14 border-b border-slate-800 bg-[#161b22]/90 backdrop-blur px-4 py-2 flex flex-wrap items-center justify-between gap-3 sticky top-0 z-50">
         {/* Real-time System KPIs */}
-        <div className="hidden lg:flex items-center gap-6 text-xs font-mono">
+        <div className="flex flex-wrap items-center gap-3 lg:gap-6 text-xs font-mono">
           <div className="flex items-center gap-2 bg-slate-900/80 px-3 py-1.5 rounded-md border border-slate-800">
             <Icon name="hardDrive" className="w-4 h-4 text-cyan-400" />
             <span className="text-slate-400">Disk Usage:</span>
@@ -885,7 +919,7 @@ useEffect(() => {
         <div className="flex items-center gap-2">
           <button 
             onClick={runFullPipeline}
-            disabled={pipelineRunning}
+            disabled={pipelineRunning || !isHydrated}
             className="flex items-center gap-1.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-black font-semibold text-xs px-3 py-1.5 rounded-md transition shadow-md shadow-cyan-500/10 disabled:opacity-50"
           >
             <Icon name="zap" className="w-4 h-4" />
@@ -992,7 +1026,7 @@ useEffect(() => {
                   <span className="text-xs bg-slate-800 text-cyan-400 px-2 py-0.5 rounded border border-slate-700 font-mono">Live Monitoring</span>
                 </h1>
                 <p className="text-xs text-slate-400">Unified Real-time Operating System Storage, Synchronization & Disk Metrics.</p>
-               <p className="text-[11px] text-emerald-400 mt-1">Persistent storage: SQLite • Files • Blocks • Logs</p>
+               <p className="text-[11px] text-emerald-400 mt-1">Persistent storage: Supabase • Files • Blocks • Logs</p>
               </div>
 
               {/* KPI Cards */}
@@ -1190,7 +1224,7 @@ useEffect(() => {
                           {selectedFile.blocks && selectedFile.blocks.map((blk, idx) => (
                             <span key={blk} className="px-2.5 py-1 bg-cyan-950/80 border border-cyan-800 text-cyan-300 rounded flex items-center gap-1.5">
                               <span>Block #{blk}</span>
-                              <span className="text-[10px] text-slate-500">(Track {selectedFile.tracks?.[idx] || blk * 3})</span>
+                              <span className="text-[10px] text-slate-500">(Track {selectedFile.tracks?.[idx] ?? blk * 3})</span>
                             </span>
                           ))}
                         </div>
@@ -1359,7 +1393,7 @@ useEffect(() => {
 
                 <button
                   onClick={runDiskScheduler}
-                  disabled={isSchedulingRunning}
+                  disabled={isSchedulingRunning || !isHydrated}
                   className="flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-400 text-black font-semibold text-xs px-4 py-2 rounded-lg transition disabled:opacity-50"
                 >
                   <Icon name="play" className="w-4 h-4" /> Run {algorithm} Algorithm
@@ -1396,8 +1430,21 @@ useEffect(() => {
                   <label className="text-slate-400 block mb-1">Track Requests Queue:</label>
                   <input
                     type="text"
-                    value={requestQueue.join(", ")}
-                    onChange={(e) => setRequestQueue(e.target.value.split(",").map(n => parseInt(n.trim())).filter(n => !isNaN(n)))}
+                    value={queueInput}
+                    onChange={(e) => setQueueInput(e.target.value)}
+                    onBlur={() => {
+                      const parts = queueInput.split(",").map(part => part.trim());
+                      const valid = parts.length > 0 && parts.every(part =>
+                        /^\d+$/.test(part) && Number(part) >= 0 && Number(part) <= 199
+                      );
+                      if (valid) {
+                        setRequestQueue(parts.map(Number));
+                        setQueueInput(parts.map(Number).join(", "));
+                      } else {
+                        setQueueInput(requestQueue.join(", "));
+                        addLog("Enter comma-separated track numbers from 0 to 199.", "DISK", "WARN");
+                      }
+                    }}
                     className="w-full bg-slate-900 border border-slate-800 text-cyan-300 rounded px-2.5 py-1.5 focus:outline-none"
                   />
                 </div>
