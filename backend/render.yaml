@@ -1,12 +1,16 @@
 services:
   - type: web
     name: vfs-nexus-api
-    env: node
+    runtime: node
     rootDir: backend
     buildCommand: npm install
     startCommand: npm start
     envVars:
-      - key: MONGODB_URI
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_PUBLISHABLE_KEY
         sync: false
       - key: FRONTEND_ORIGIN
         sync: false

@@ -1,12 +1,9 @@
+import 'dotenv/config';
+import { authClient } from './database.js';
 
-import { DatabaseSync } from 'node:sqlite';
-
-const db = new DatabaseSync('./data/vfs_nexus.db');
-
-const tables = db.prepare(
-  "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
-).all();
-
-console.log('SQLite tables:', tables);
-
-db.close();
+// Checks Supabase configuration without opening a local SQLite file.
+const response = await fetch(`${process.env.SUPABASE_URL}/auth/v1/health`, {
+  headers: { apikey: process.env.SUPABASE_PUBLISHABLE_KEY }
+});
+if (!response.ok) throw new Error(`Supabase Auth health check failed: ${response.status}`);
+console.log('Supabase Auth reachable. To verify user_simulator_states, sign in and call GET /api/state with your access token.');

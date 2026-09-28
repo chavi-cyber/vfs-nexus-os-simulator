@@ -1773,3 +1773,4 @@ function DirectoryTreeNode({ node, selectedFile, onSelectFile, onDelete }) {
     </div>
   );
 }
+
