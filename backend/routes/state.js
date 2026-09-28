@@ -1,12 +1,6 @@
-
-import express from "express";
-import db from "../db/database.js";
-
-import {
-  DEFAULT_FILESYSTEM,
-  DEFAULT_LOGS,
-  DEFAULT_STATE
-} from "../seed.js";
+import express from 'express';
+import { authClient, createUserDb } from '../db/database.js';
+import { DEFAULT_FILESYSTEM, DEFAULT_LOGS, DEFAULT_STATE } from '../seed.js';
 
 const router = express.Router();
 
@@ -18,87 +12,61 @@ function defaultPayload() {
   };
 }
 
-function saveState(payload) {
+// Every state operation is authenticated and restricted to the signed-in user.
+router.use(async (req, res, next) => {
+  const token = /^Bearer (.+)$/i.exec(req.get('authorization') || '')?.[1];
+  if (!token) return res.status(401).json({ message: 'Missing access token' });
+
+  try {
+    const { data: { user }, error } = await authClient.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ message: 'Invalid or expired access token' });
+    req.userId = user.id;
+    req.db = createUserDb(token);
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+async function saveState(req, payload) {
   if (!payload || !Array.isArray(payload.fileSystem)) {
-    throw new Error("fileSystem must be an array");
+    const error = new Error('fileSystem must be an array');
+    error.status = 400;
+    throw error;
   }
-
-  const json = JSON.stringify(payload);
-
-  db.prepare(`
-    INSERT INTO system_state (id, state_json, updated_at)
-    VALUES (1, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(id) DO UPDATE SET
-      state_json = excluded.state_json,
-      updated_at = CURRENT_TIMESTAMP
-  `).run(json);
+  const { error } = await req.db.from('user_simulator_states').upsert({
+    user_id: req.userId,
+    state: payload,
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'user_id' });
+  if (error) throw error;
 }
 
-function loadState() {
-  const row = db.prepare(`
-    SELECT state_json
-    FROM system_state
-    WHERE id = 1
-  `).get();
-
-  if (!row) {
-    const initialState = defaultPayload();
-    saveState(initialState);
-    return initialState;
-  }
-
-  return JSON.parse(row.state_json);
-}
-
-// Load saved simulator state.
-router.get("/state", (_req, res) => {
+router.get('/state', async (req, res, next) => {
   try {
-    res.json(loadState());
-  } catch (error) {
-    console.error("Load failed:", error);
-
-    res.status(500).json({
-      message: "Failed to load persistent state",
-      error: error.message
-    });
-  }
+    const { data, error } = await req.db.from('user_simulator_states')
+      .select('state').eq('user_id', req.userId).maybeSingle();
+    if (error) throw error;
+    if (data) return res.json(data.state);
+    const initial = defaultPayload();
+    await saveState(req, initial);
+    res.json(initial);
+  } catch (error) { next(error); }
 });
 
-// Save simulator state.
-router.put("/state", (req, res) => {
+router.put('/state', async (req, res, next) => {
   try {
-    saveState(req.body);
-
-    res.json({
-      ok: true,
-      message: "State persisted to SQLite"
-    });
-  } catch (error) {
-    console.error("Save failed:", error);
-
-    res.status(400).json({
-      message: "Failed to persist state",
-      error: error.message
-    });
-  }
+    await saveState(req, req.body);
+    res.json({ ok: true, message: 'State persisted to Supabase' });
+  } catch (error) { next(error); }
 });
 
-// Restore the original simulator state.
-router.post("/reset", (_req, res) => {
+router.post('/reset', async (req, res, next) => {
   try {
-    const initialState = defaultPayload();
-
-    saveState(initialState);
-
-    res.json(initialState);
-  } catch (error) {
-    console.error("Reset failed:", error);
-
-    res.status(500).json({
-      message: "Reset failed",
-      error: error.message
-    });
-  }
+    const initial = defaultPayload();
+    await saveState(req, initial);
+    res.json(initial);
+  } catch (error) { next(error); }
 });
 
 export default router;
